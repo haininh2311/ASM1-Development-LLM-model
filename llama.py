@@ -44,7 +44,7 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The normalized tensor.
         """
         # todo
-        raise NotImplementedError
+        return x*torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         """
@@ -94,7 +94,28 @@ class Attention(nn.Module):
         attention matrix before applying it to the value tensor.
         '''
         # todo
-        raise NotImplementedError
+        # Compute attention scores
+        # Transpose key for matrix multiplication
+        scores = torch.matmul(query, key.transpose(-1, -2))
+
+        # Scale the scores
+        # Divide by square root of head dimension to prevent softmax from having extremely small gradients
+        scaling_factor = 1.0 / math.sqrt(query.size(-1))
+        scores = scores * scaling_factor
+
+        # Apply softmax to get attention weights
+        # Along the last dimension (keys/sequence length)
+        attention_weights = F.softmax(scores, dim=-1)
+        
+        # Apply dropout to attention weights
+        attention_weights = self.attn_dropout(attention_weights)
+        
+        # Compute weighted sum of values
+        # (batch_size, n_local_heads, seqlen, seqlen) @ (batch_size, n_local_heads, seqlen, head_dim)
+        # -> (batch_size, n_local_heads, seqlen, head_dim)
+        context = torch.matmul(attention_weights, value)
+        
+        return context
 
     def forward(
         self,
@@ -197,7 +218,31 @@ class LlamaLayer(nn.Module):
            output of the feed-forward network
         '''
         # todo
-        raise NotImplementedError
+        # Lưu lại đầu vào ban đầu để thực hiện residual connection
+        residual = x
+        
+        # 1. Áp dụng RMS Layer Normalization cho đầu vào
+        x_normalized = self.attention_norm(x)
+        
+        # 2. Thực hiện self-attention trên đầu vào đã được chuẩn hóa
+        attention_output = self.attention(x_normalized)
+        
+        # 3. Thực hiện residual connection cho self-attention
+        x = residual + attention_output
+        
+        # Lưu lại đầu vào trước khi qua attention để thực hiện residual connection tiếp theo
+        residual = x
+        
+        # 4. Áp dụng RMS Layer Normalization cho đầu ra của self-attention
+        x_normalized = self.ffn_norm(x)
+        
+        # 5. Thực hiện feed-forward network trên đầu vào đã được chuẩn hóa
+        ffn_output = self.feed_forward(x_normalized)
+        
+        # 6. Thực hiện residual connection cho feed-forward network
+        x = residual + ffn_output
+        
+        return x
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -274,11 +319,10 @@ class Llama(LlamaPreTrainedModel):
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] # crop to just the final time step
             # todo
-            raise NotImplementedError
 
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 '''
                 Perform temperature sampling:
@@ -289,7 +333,15 @@ class Llama(LlamaPreTrainedModel):
 
                 Note that we are not using top-k sampling/nucleus sampling in this procedure.
                 '''
-                idx_next = None
+                # Scale logits by temperature
+                scaled_logits = logits / temperature
+
+                # Apply softmax to get probabilities
+                probabilities = F.softmax(scaled_logits, dim=-1)
+
+                # Sample from the probability distribution
+                idx_next = torch.multinomial(probabilities, num_samples=1)
+
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
@@ -297,24 +349,24 @@ class Llama(LlamaPreTrainedModel):
         return idx
 
 def load_pretrained(checkpoint):
-  device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-  #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-  dtype = "float32"
+    device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+    #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+    dtype = "float32"
 
-  torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-  torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-  device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-  ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-  ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+    torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+    device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-  # init from a model saved in a specific directory
-  checkpoint_dict = torch.load(checkpoint, map_location=device)
-  config = LlamaConfig(**checkpoint_dict['model_args'])
-  model = Llama(config)
-  state_dict = checkpoint_dict['model']
-  unwanted_prefix = '_orig_mod.'
-  for k,v in list(state_dict.items()):
-      if k.startswith(unwanted_prefix):
-          state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-  model.load_state_dict(state_dict, strict=False)
-  return model
+    # init from a model saved in a specific directory
+    checkpoint_dict = torch.load(checkpoint, map_location=device)
+    config = LlamaConfig(**checkpoint_dict['model_args'])
+    model = Llama(config)
+    state_dict = checkpoint_dict['model']
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict, strict=False)
+    return model
